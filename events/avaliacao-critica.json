@@ -1,0 +1,9 @@
+{
+  "version": "2.0",
+  "routeKey": "POST /avaliacao",
+  "rawPath": "/avaliacao",
+  "headers": { "content-type": "application/json" },
+  "requestContext": { "http": { "method": "POST", "path": "/avaliacao" } },
+  "body": "{\"descricao\":\"O áudio da aula 3 está inaudível\",\"nota\":2}",
+  "isBase64Encoded": false
+}

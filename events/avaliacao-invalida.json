@@ -1,0 +1,9 @@
+{
+  "version": "2.0",
+  "routeKey": "POST /avaliacao",
+  "rawPath": "/avaliacao",
+  "headers": { "content-type": "application/json" },
+  "requestContext": { "http": { "method": "POST", "path": "/avaliacao" } },
+  "body": "{\"descricao\":\"\",\"nota\":15}",
+  "isBase64Encoded": false
+}

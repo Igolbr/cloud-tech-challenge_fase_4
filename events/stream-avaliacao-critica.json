@@ -1,0 +1,23 @@
+{
+  "Records": [
+    {
+      "eventID": "1",
+      "eventName": "INSERT",
+      "eventSource": "aws:dynamodb",
+      "awsRegion": "us-east-1",
+      "dynamodb": {
+        "Keys": { "id": { "S": "6f1c2a52-0000-4000-8000-000000000001" } },
+        "NewImage": {
+          "id": { "S": "6f1c2a52-0000-4000-8000-000000000001" },
+          "descricao": { "S": "O áudio da aula 3 está inaudível" },
+          "nota": { "N": "2" },
+          "urgencia": { "S": "CRITICA" },
+          "dataEnvio": { "S": "2026-10-06T15:00:00Z" },
+          "dia": { "S": "2026-10-06" }
+        },
+        "SequenceNumber": "100000000000000000001",
+        "StreamViewType": "NEW_IMAGE"
+      }
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+version = 0.1
+
+[default.global.parameters]
+stack_name = "plataforma-feedback-dev"
+
+[default.build.parameters]
+cached = true
+parallel = true
+
+[default.deploy.parameters]
+region = "us-east-1"
+resolve_s3 = true
+s3_prefix = "plataforma-feedback-dev"
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+fail_on_empty_changeset = false
+# O e-mail do administrador é informado no deploy:
+#   sam deploy --parameter-overrides EmailAdministrador=voce@exemplo.com
+
+[default.local_start_api.parameters]
+warm_containers = "EAGER"

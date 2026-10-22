@@ -38,10 +38,10 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Validar template.yaml
+      - name: Validar templates
         run: |
           pip install cfn-lint
-          cfn-lint template.yaml
+          cfn-lint template.yaml infra/conta.yaml
 
   deploy:
     name: Deploy (AWS SAM)
@@ -49,6 +49,11 @@ jobs:
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment: dev
+    permissions:
+      contents: read
+      id-token: write # necessário para o GitHub emitir o token OIDC
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -62,27 +67,58 @@ jobs:
         with:
           use-installer: true
 
-      # Credenciais ficam nos segredos do repositório, nunca no código
-      - uses: aws-actions/configure-aws-credentials@v4
+      # Preferencial: OIDC. O GitHub troca um token temporário pelo papel criado em
+      # infra/conta.yaml; nenhuma chave de acesso fica guardada.
+      - name: Credenciais AWS (OIDC)
+        if: vars.AWS_ROLE_ARN != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: github-deploy-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Alternativa enquanto o OIDC não estiver configurado: usuário de deploy restrito,
+      # com as chaves nos segredos do repositório (nunca no código).
+      - name: Credenciais AWS (usuário de deploy)
+        if: vars.AWS_ROLE_ARN == ''
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+          aws-region: ${{ env.AWS_REGION }}
 
       - name: sam build
         run: sam build
 
       - name: sam deploy
+        env:
+          EMAIL_ADMINISTRADOR: ${{ secrets.EMAIL_ADMINISTRADOR }}
+          EMAIL_ALERTAS: ${{ secrets.EMAIL_ALERTAS }}
+          LIMITE_ORCAMENTO_USD: ${{ vars.LIMITE_ORCAMENTO_USD }}
+          AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+          AWS_CFN_EXEC_ROLE_ARN: ${{ vars.AWS_CFN_EXEC_ROLE_ARN }}
+          AWS_ARTIFACTS_BUCKET: ${{ vars.AWS_ARTIFACTS_BUCKET }}
         run: |
-          sam deploy \
+          PARAMS="Ambiente=dev EmailAdministrador=$EMAIL_ADMINISTRADOR"
+          if [ -n "$EMAIL_ALERTAS" ]; then PARAMS="$PARAMS EmailAlertas=$EMAIL_ALERTAS"; fi
+          if [ -n "$LIMITE_ORCAMENTO_USD" ]; then PARAMS="$PARAMS LimiteOrcamentoMensalUsd=$LIMITE_ORCAMENTO_USD"; fi
+
+          # Com OIDC o papel do GitHub não cria recursos: o CloudFormation usa o papel de
+          # execução, e os pacotes vão para o bucket criado em infra/conta.yaml.
+          EXTRA=()
+          if [ -n "$AWS_ROLE_ARN" ]; then
+            EXTRA=(--config-env ci --s3-bucket "$AWS_ARTIFACTS_BUCKET" --role-arn "$AWS_CFN_EXEC_ROLE_ARN")
+          fi
+
+          sam deploy "${EXTRA[@]}" \
             --no-confirm-changeset \
             --no-fail-on-empty-changeset \
-            --region "${{ vars.AWS_REGION || 'us-east-1' }}" \
-            --parameter-overrides "Ambiente=dev EmailAdministrador=${{ secrets.EMAIL_ADMINISTRADOR }}"
+            --region "$AWS_REGION" \
+            --parameter-overrides "$PARAMS"
 
-      - name: URL da API
+      - name: URL da API e do dashboard
         run: |
           aws cloudformation describe-stacks \
             --stack-name plataforma-feedback-dev \
-            --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue" \
+            --query "Stacks[0].Outputs[?OutputKey=='ApiUrl' || OutputKey=='DashboardUrl'].[OutputKey,OutputValue]" \
             --output text

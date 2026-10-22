@@ -61,6 +61,7 @@ public class NotificarUrgenciaHandler implements RequestHandler<DynamodbEvent, S
                 notificador.enviar(alerta.get().assunto(), alerta.get().mensagem(fusoHorario));
                 log(context, "Alerta enviado para a avaliação " + alerta.get().id());
             } catch (RuntimeException e) {
+                // O texto "Falha ao processar registro" alimenta a métrica FalhasEnvioAlertaUrgencia (template.yaml)
                 log(context, "Falha ao processar registro " + registro.getEventID() + ": " + e);
                 // Em streams, a Lambda retoma a partir do primeiro registro com falha
                 falhas.add(new StreamsEventResponse.BatchItemFailure(registro.getDynamodb().getSequenceNumber()));

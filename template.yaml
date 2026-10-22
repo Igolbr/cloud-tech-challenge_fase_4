@@ -4,6 +4,8 @@ Description: >
   Plataforma de Feedback de Aulas (FIAP Tech Challenge - Fase 4).
   Três funções Lambda com responsabilidade única: receber-avaliacao (API),
   notificar-urgencia (DynamoDB Streams) e gerar-relatorio-semanal (EventBridge Scheduler).
+  Inclui monitoramento (dashboard, alarmes, retenção de logs) e segurança
+  (papéis IAM de menor privilégio, criptografia, throttling da API, orçamento).
 
 Parameters:
   Ambiente:
@@ -16,10 +18,42 @@ Parameters:
     Description: E-mail que recebe os avisos de urgência e o relatório semanal (confirmar a assinatura no e-mail recebido).
     AllowedPattern: "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
     ConstraintDescription: Informe um e-mail válido.
+  EmailAlertas:
+    Type: String
+    Default: ""
+    Description: >
+      E-mail que recebe os alarmes técnicos (erros, falhas da API, orçamento). Vazio = usa o EmailAdministrador.
+      Outros administradores podem ser assinados no tópico de alarmes (ver docs/monitoramento-e-seguranca.md).
+    AllowedPattern: "^$|^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
+    ConstraintDescription: Informe um e-mail válido ou deixe vazio.
   FusoHorario:
     Type: String
     Default: America/Sao_Paulo
     Description: Fuso usado para definir o "dia" da avaliação, nas datas dos e-mails e no agendamento do relatório.
+  RetencaoLogsDias:
+    Type: Number
+    Default: 30
+    AllowedValues: [7, 14, 30, 60, 90]
+    Description: Dias que os logs das funções e da API ficam guardados no CloudWatch (controla o custo).
+  ApiLimiteRequisicoesPorSegundo:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    Description: Taxa média de requisições por segundo aceita pela API (acima disso responde 429).
+  ApiLimiteRajada:
+    Type: Number
+    Default: 20
+    MinValue: 1
+    Description: Pico de requisições simultâneas aceito pela API antes do throttling.
+  LimiteOrcamentoMensalUsd:
+    Type: Number
+    Default: 10
+    MinValue: 0
+    Description: Limite do alerta de orçamento mensal da conta, em USD. Use 0 para não criar o orçamento.
+
+Conditions:
+  TemEmailAlertas: !Not [!Equals [!Ref EmailAlertas, ""]]
+  CriarOrcamento: !Not [!Equals [!Ref LimiteOrcamentoMensalUsd, 0]]
 
 Globals:
   Function:
@@ -67,8 +101,12 @@ Resources:
             ProjectionType: ALL
       StreamSpecification:
         StreamViewType: NEW_IMAGE
+      # Criptografia em repouso com chave KMS gerenciada pela AWS (aws/dynamodb)
       SSESpecification:
         SSEEnabled: true
+      # Backup contínuo: permite restaurar a tabela em qualquer ponto dos últimos 35 dias
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
       Tags:
         - Key: Projeto
           Value: plataforma-feedback
@@ -78,6 +116,7 @@ Resources:
   # ---------------------------------------------------------------------------
   # Mensageria
   # ---------------------------------------------------------------------------
+  # Tópico de negócio: avisos de avaliações críticas e relatório semanal
   TopicoNotificacoes:
     Type: AWS::SNS::Topic
     Properties:
@@ -96,6 +135,305 @@ Resources:
       Protocol: email
       Endpoint: !Ref EmailAdministrador
 
+  PoliticaTopicoNotificacoes:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref TopicoNotificacoes]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: SomenteContaDoProjeto
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            Action:
+              - sns:Publish
+              - sns:Subscribe
+              - sns:GetTopicAttributes
+              - sns:ListSubscriptionsByTopic
+            Resource: !Ref TopicoNotificacoes
+          - Sid: NegarSemHttps
+            Effect: Deny
+            Principal: "*"
+            Action: sns:Publish
+            Resource: !Ref TopicoNotificacoes
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  # Tópico técnico: alarmes do CloudWatch e do orçamento. Separado do tópico de
+  # avaliações para que problemas da aplicação não se misturem com o feedback dos alunos.
+  TopicoAlarmes:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "plataforma-feedback-alarmes-${Ambiente}"
+      DisplayName: Alarmes Feedback
+      Tags:
+        - Key: Projeto
+          Value: plataforma-feedback
+        - Key: Ambiente
+          Value: !Ref Ambiente
+
+  AssinaturaEmailAlertas:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref TopicoAlarmes
+      Protocol: email
+      Endpoint: !If [TemEmailAlertas, !Ref EmailAlertas, !Ref EmailAdministrador]
+
+  PoliticaTopicoAlarmes:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref TopicoAlarmes]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: SomenteContaDoProjeto
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            Action:
+              - sns:Publish
+              - sns:Subscribe
+              - sns:GetTopicAttributes
+              - sns:ListSubscriptionsByTopic
+            Resource: !Ref TopicoAlarmes
+          - Sid: CloudWatchEOrcamentoPublicam
+            Effect: Allow
+            Principal:
+              Service:
+                - cloudwatch.amazonaws.com
+                - budgets.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref TopicoAlarmes
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+          - Sid: NegarSemHttps
+            Effect: Deny
+            Principal: "*"
+            Action: sns:Publish
+            Resource: !Ref TopicoAlarmes
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  # ---------------------------------------------------------------------------
+  # Logs (retenção definida para controlar custo; sem isso o CloudWatch guarda para sempre)
+  # ---------------------------------------------------------------------------
+  LogsReceberAvaliacao:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/plataforma-feedback/${Ambiente}/receber-avaliacao"
+      RetentionInDays: !Ref RetencaoLogsDias
+      Tags:
+        - Key: Projeto
+          Value: plataforma-feedback
+        - Key: Ambiente
+          Value: !Ref Ambiente
+
+  LogsNotificarUrgencia:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/plataforma-feedback/${Ambiente}/notificar-urgencia"
+      RetentionInDays: !Ref RetencaoLogsDias
+      Tags:
+        - Key: Projeto
+          Value: plataforma-feedback
+        - Key: Ambiente
+          Value: !Ref Ambiente
+
+  LogsGerarRelatorioSemanal:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/plataforma-feedback/${Ambiente}/gerar-relatorio-semanal"
+      RetentionInDays: !Ref RetencaoLogsDias
+      Tags:
+        - Key: Projeto
+          Value: plataforma-feedback
+        - Key: Ambiente
+          Value: !Ref Ambiente
+
+  LogsAcessoApi:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/plataforma-feedback/${Ambiente}/api-acesso"
+      RetentionInDays: !Ref RetencaoLogsDias
+      Tags:
+        - Key: Projeto
+          Value: plataforma-feedback
+        - Key: Ambiente
+          Value: !Ref Ambiente
+
+  # Contam as falhas que a aplicação registra no log, inclusive as que não viram
+  # erro da Lambda (ex.: notificar-urgencia trata a falha e devolve o registro para reprocessar).
+  FiltroFalhasGravacao:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref LogsReceberAvaliacao
+      FilterPattern: '"Falha ao gravar"'
+      MetricTransformations:
+        - MetricNamespace: !Sub "PlataformaFeedback/${Ambiente}"
+          MetricName: FalhasGravacaoDynamoDB
+          MetricValue: "1"
+          DefaultValue: 0
+
+  FiltroFalhasAlertaUrgencia:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref LogsNotificarUrgencia
+      FilterPattern: '"Falha ao processar registro"'
+      MetricTransformations:
+        - MetricNamespace: !Sub "PlataformaFeedback/${Ambiente}"
+          MetricName: FalhasEnvioAlertaUrgencia
+          MetricValue: "1"
+          DefaultValue: 0
+
+  # ---------------------------------------------------------------------------
+  # Papéis IAM: um por função, com o mínimo de permissão que o código usa
+  # ---------------------------------------------------------------------------
+  PapelReceberAvaliacao:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: receber-avaliacao - apenas grava (PutItem) na tabela de avaliações e escreve o próprio log.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: gravar-avaliacao
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: GravarAvaliacao
+                Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt TabelaAvaliacoes.Arn
+              - Sid: EscreverLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt LogsReceberAvaliacao.Arn
+      Tags:
+        - Key: Projeto
+          Value: plataforma-feedback
+        - Key: Ambiente
+          Value: !Ref Ambiente
+
+  PapelNotificarUrgencia:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: notificar-urgencia - apenas lê o stream da tabela, publica no tópico de notificações e escreve o próprio log.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: ler-stream-e-notificar
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: LerStreamDaTabela
+                Effect: Allow
+                Action:
+                  - dynamodb:DescribeStream
+                  - dynamodb:GetRecords
+                  - dynamodb:GetShardIterator
+                Resource: !GetAtt TabelaAvaliacoes.StreamArn
+              - Sid: ListarStreams
+                Effect: Allow
+                Action: dynamodb:ListStreams
+                Resource: !Sub "${TabelaAvaliacoes.Arn}/stream/*"
+              - Sid: PublicarAviso
+                Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref TopicoNotificacoes
+              - Sid: EscreverLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt LogsNotificarUrgencia.Arn
+      Tags:
+        - Key: Projeto
+          Value: plataforma-feedback
+        - Key: Ambiente
+          Value: !Ref Ambiente
+
+  PapelGerarRelatorioSemanal:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: gerar-relatorio-semanal - apenas consulta (Query) o índice por-dia, publica no tópico de notificações e escreve o próprio log.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: consultar-e-enviar-relatorio
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ConsultarIndicePorDia
+                Effect: Allow
+                Action: dynamodb:Query
+                Resource: !Sub "${TabelaAvaliacoes.Arn}/index/por-dia"
+              - Sid: PublicarRelatorio
+                Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref TopicoNotificacoes
+              - Sid: EscreverLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt LogsGerarRelatorioSemanal.Arn
+      Tags:
+        - Key: Projeto
+          Value: plataforma-feedback
+        - Key: Ambiente
+          Value: !Ref Ambiente
+
+  # ---------------------------------------------------------------------------
+  # API (HTTP API só aceita HTTPS; não existe endpoint HTTP)
+  # ---------------------------------------------------------------------------
+  ApiAvaliacoes:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      Description: API pública da plataforma de feedback (POST /avaliacao).
+      # Limita a taxa de requisições para evitar abuso; o excedente recebe 429
+      DefaultRouteSettings:
+        ThrottlingRateLimit: !Ref ApiLimiteRequisicoesPorSegundo
+        ThrottlingBurstLimit: !Ref ApiLimiteRajada
+      # Log de acesso sem IP nem user agent: nenhum dado pessoal do aluno é registrado
+      AccessLogSettings:
+        DestinationArn: !GetAtt LogsAcessoApi.Arn
+        Format: >-
+          {"requestId":"$context.requestId","horario":"$context.requestTime","rota":"$context.routeKey",
+          "status":"$context.status","latenciaMs":"$context.responseLatency",
+          "latenciaIntegracaoMs":"$context.integrationLatency","erroIntegracao":"$context.integrationErrorMessage"}
+      Tags:
+        Projeto: plataforma-feedback
+        Ambiente: !Ref Ambiente
+
   # ---------------------------------------------------------------------------
   # Funções
   # ---------------------------------------------------------------------------
@@ -106,16 +444,18 @@ Resources:
       Description: Valida e grava a avaliação recebida em POST /avaliacao.
       CodeUri: src/receber_avaliacao
       Handler: br.com.fiap.feedback.receber.ReceberAvaliacaoHandler::handleRequest
+      Role: !GetAtt PapelReceberAvaliacao.Arn
+      LoggingConfig:
+        LogGroup: !Ref LogsReceberAvaliacao
+        LogFormat: Text
       Environment:
         Variables:
           TABELA_AVALIACOES: !Ref TabelaAvaliacoes
-      Policies:
-        - DynamoDBWritePolicy:
-            TableName: !Ref TabelaAvaliacoes
       Events:
         PostAvaliacao:
           Type: HttpApi
           Properties:
+            ApiId: !Ref ApiAvaliacoes
             Path: /avaliacao
             Method: POST
 
@@ -126,12 +466,13 @@ Resources:
       Description: Avisa os administradores por e-mail (SNS) sobre avaliações críticas.
       CodeUri: src/notificar_urgencia
       Handler: br.com.fiap.feedback.notificar.NotificarUrgenciaHandler::handleRequest
+      Role: !GetAtt PapelNotificarUrgencia.Arn
+      LoggingConfig:
+        LogGroup: !Ref LogsNotificarUrgencia
+        LogFormat: Text
       Environment:
         Variables:
           TOPICO_ALERTA_ARN: !Ref TopicoNotificacoes
-      Policies:
-        - SNSPublishMessagePolicy:
-            TopicName: !GetAtt TopicoNotificacoes.TopicName
       Events:
         NovaAvaliacao:
           Type: DynamoDB
@@ -155,15 +496,14 @@ Resources:
       CodeUri: src/gerar_relatorio_semanal
       Handler: br.com.fiap.feedback.relatorio.GerarRelatorioSemanalHandler::handleRequest
       Timeout: 60
+      Role: !GetAtt PapelGerarRelatorioSemanal.Arn
+      LoggingConfig:
+        LogGroup: !Ref LogsGerarRelatorioSemanal
+        LogFormat: Text
       Environment:
         Variables:
           TABELA_AVALIACOES: !Ref TabelaAvaliacoes
           TOPICO_RELATORIO_ARN: !Ref TopicoNotificacoes
-      Policies:
-        - DynamoDBReadPolicy:
-            TableName: !Ref TabelaAvaliacoes
-        - SNSPublishMessagePolicy:
-            TopicName: !GetAtt TopicoNotificacoes.TopicName
       Events:
         Semanal:
           Type: ScheduleV2
@@ -175,16 +515,327 @@ Resources:
             RetryPolicy:
               MaximumRetryAttempts: 2
 
+  # ---------------------------------------------------------------------------
+  # Alarmes (todos avisam o tópico de alarmes, no disparo e na normalização)
+  # ---------------------------------------------------------------------------
+  AlarmeErrosReceberAvaliacao:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "plataforma-feedback-${Ambiente}-receber-avaliacao-erros"
+      AlarmDescription: A função receber-avaliacao falhou (erro não tratado). Veja os logs em /plataforma-feedback/<ambiente>/receber-avaliacao.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ReceberAvaliacaoFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref TopicoAlarmes]
+      OKActions: [!Ref TopicoAlarmes]
+
+  AlarmeErrosNotificarUrgencia:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "plataforma-feedback-${Ambiente}-notificar-urgencia-erros"
+      AlarmDescription: A função notificar-urgencia falhou (erro não tratado). Avisos de avaliações críticas podem não ter sido enviados.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref NotificarUrgenciaFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref TopicoAlarmes]
+      OKActions: [!Ref TopicoAlarmes]
+
+  AlarmeErrosGerarRelatorioSemanal:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "plataforma-feedback-${Ambiente}-gerar-relatorio-semanal-erros"
+      AlarmDescription: A função gerar-relatorio-semanal falhou. O relatório da semana pode não ter sido enviado; ela pode ser invocada manualmente após a correção.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref GerarRelatorioSemanalFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref TopicoAlarmes]
+      OKActions: [!Ref TopicoAlarmes]
+
+  # Duração próxima do timeout: 80% do Timeout de cada função (30 s -> 24 s; 60 s -> 48 s)
+  AlarmeDuracaoReceberAvaliacao:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "plataforma-feedback-${Ambiente}-receber-avaliacao-duracao"
+      AlarmDescription: receber-avaliacao levou mais de 80% do timeout (24 de 30 s). Risco de timeout e erro 5xx para o aluno.
+      Namespace: AWS/Lambda
+      MetricName: Duration
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ReceberAvaliacaoFunction
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 24000
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref TopicoAlarmes]
+      OKActions: [!Ref TopicoAlarmes]
+
+  AlarmeDuracaoNotificarUrgencia:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "plataforma-feedback-${Ambiente}-notificar-urgencia-duracao"
+      AlarmDescription: notificar-urgencia levou mais de 80% do timeout (24 de 30 s).
+      Namespace: AWS/Lambda
+      MetricName: Duration
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref NotificarUrgenciaFunction
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 24000
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref TopicoAlarmes]
+      OKActions: [!Ref TopicoAlarmes]
+
+  AlarmeDuracaoGerarRelatorioSemanal:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "plataforma-feedback-${Ambiente}-gerar-relatorio-semanal-duracao"
+      AlarmDescription: gerar-relatorio-semanal levou mais de 80% do timeout (48 de 60 s). Com mais avaliações, aumente o Timeout ou a memória.
+      Namespace: AWS/Lambda
+      MetricName: Duration
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref GerarRelatorioSemanalFunction
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 48000
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref TopicoAlarmes]
+      OKActions: [!Ref TopicoAlarmes]
+
+  AlarmeApi5xx:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "plataforma-feedback-${Ambiente}-api-5xx"
+      AlarmDescription: A API respondeu erro 5xx a pelo menos um aluno nos últimos 5 minutos.
+      Namespace: AWS/ApiGateway
+      MetricName: 5xx
+      Dimensions:
+        - Name: ApiId
+          Value: !Ref ApiAvaliacoes
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref TopicoAlarmes]
+      OKActions: [!Ref TopicoAlarmes]
+
+  # Soma as falhas de gravação vistas pela aplicação (inclui AccessDenied e validações
+  # do DynamoDB) com os erros de sistema e throttling medidos pelo próprio DynamoDB.
+  AlarmeFalhaGravacaoDynamoDB:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "plataforma-feedback-${Ambiente}-dynamodb-gravacao"
+      AlarmDescription: Falha ao gravar avaliação no DynamoDB (erro da aplicação, erro de sistema ou throttling). Avaliações podem ter sido perdidas.
+      Metrics:
+        - Id: falhasApp
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Sub "PlataformaFeedback/${Ambiente}"
+              MetricName: FalhasGravacaoDynamoDB
+            Period: 300
+            Stat: Sum
+        - Id: errosSistema
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/DynamoDB
+              MetricName: SystemErrors
+              Dimensions:
+                - Name: TableName
+                  Value: !Ref TabelaAvaliacoes
+                - Name: Operation
+                  Value: PutItem
+            Period: 300
+            Stat: Sum
+        - Id: throttling
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/DynamoDB
+              MetricName: WriteThrottleEvents
+              Dimensions:
+                - Name: TableName
+                  Value: !Ref TabelaAvaliacoes
+            Period: 300
+            Stat: Sum
+        - Id: total
+          Label: Falhas de gravação
+          ReturnData: true
+          Expression: FILL(falhasApp, 0) + FILL(errosSistema, 0) + FILL(throttling, 0)
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref TopicoAlarmes]
+      OKActions: [!Ref TopicoAlarmes]
+
+  # notificar-urgencia trata a falha e devolve o registro ao stream, então o erro
+  # não aparece na métrica Errors da Lambda; por isso o alarme lê o log.
+  AlarmeFalhaEnvioAlertaUrgencia:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "plataforma-feedback-${Ambiente}-notificar-urgencia-falha-envio"
+      AlarmDescription: Falha ao enviar o aviso de avaliação crítica pelo SNS. O registro é reprocessado até 3 vezes; depois disso o aviso é perdido.
+      Namespace: !Sub "PlataformaFeedback/${Ambiente}"
+      MetricName: FalhasEnvioAlertaUrgencia
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref TopicoAlarmes]
+      OKActions: [!Ref TopicoAlarmes]
+
+  # ---------------------------------------------------------------------------
+  # Dashboard
+  # ---------------------------------------------------------------------------
+  DashboardPlataforma:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "plataforma-feedback-${Ambiente}"
+      DashboardBody: !Sub
+        - |
+          {
+            "start": "-PT24H",
+            "periodOverride": "inherit",
+            "widgets": [
+              {"type": "text", "x": 0, "y": 0, "width": 24, "height": 2, "properties": {"markdown": "## Plataforma de Feedback de Aulas (${Ambiente})\nFunções: **${FnReceber}**, **${FnNotificar}**, **${FnRelatorio}** · Tabela **${Tabela}** · Alarmes enviados para o tópico **${TopicoAlarmesNome}**"}},
+              {"type": "alarm", "x": 0, "y": 2, "width": 24, "height": 3, "properties": {"title": "Estado dos alarmes", "alarms": [
+                "${AlarmeErrosReceberAvaliacao.Arn}", "${AlarmeErrosNotificarUrgencia.Arn}", "${AlarmeErrosGerarRelatorioSemanal.Arn}",
+                "${AlarmeDuracaoReceberAvaliacao.Arn}", "${AlarmeDuracaoNotificarUrgencia.Arn}", "${AlarmeDuracaoGerarRelatorioSemanal.Arn}",
+                "${AlarmeApi5xx.Arn}", "${AlarmeFalhaGravacaoDynamoDB.Arn}", "${AlarmeFalhaEnvioAlertaUrgencia.Arn}"]}},
+
+              {"type": "metric", "x": 0, "y": 5, "width": 6, "height": 6, "properties": {"title": "Lambda - Invocações", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Sum", "period": 300, "metrics": [
+                ["AWS/Lambda", "Invocations", "FunctionName", "${FnReceber}", {"label": "receber-avaliacao"}],
+                ["...", "${FnNotificar}", {"label": "notificar-urgencia"}],
+                ["...", "${FnRelatorio}", {"label": "gerar-relatorio-semanal"}]]}},
+              {"type": "metric", "x": 6, "y": 5, "width": 6, "height": 6, "properties": {"title": "Lambda - Erros", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Sum", "period": 300, "metrics": [
+                ["AWS/Lambda", "Errors", "FunctionName", "${FnReceber}", {"label": "receber-avaliacao"}],
+                ["...", "${FnNotificar}", {"label": "notificar-urgencia"}],
+                ["...", "${FnRelatorio}", {"label": "gerar-relatorio-semanal"}]]}},
+              {"type": "metric", "x": 12, "y": 5, "width": 6, "height": 6, "properties": {"title": "Lambda - Duração máxima (ms)", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Maximum", "period": 300, "metrics": [
+                ["AWS/Lambda", "Duration", "FunctionName", "${FnReceber}", {"label": "receber-avaliacao"}],
+                ["...", "${FnNotificar}", {"label": "notificar-urgencia"}],
+                ["...", "${FnRelatorio}", {"label": "gerar-relatorio-semanal"}]],
+                "annotations": {"horizontal": [{"label": "80% do timeout (30 s)", "value": 24000}]}}},
+              {"type": "metric", "x": 18, "y": 5, "width": 6, "height": 6, "properties": {"title": "Lambda - Throttles", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Sum", "period": 300, "metrics": [
+                ["AWS/Lambda", "Throttles", "FunctionName", "${FnReceber}", {"label": "receber-avaliacao"}],
+                ["...", "${FnNotificar}", {"label": "notificar-urgencia"}],
+                ["...", "${FnRelatorio}", {"label": "gerar-relatorio-semanal"}]]}},
+
+              {"type": "metric", "x": 0, "y": 11, "width": 8, "height": 6, "properties": {"title": "API - Requisições", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Sum", "period": 300, "metrics": [
+                ["AWS/ApiGateway", "Count", "ApiId", "${ApiAvaliacoes}", {"label": "Total"}]]}},
+              {"type": "metric", "x": 8, "y": 11, "width": 8, "height": 6, "properties": {"title": "API - Erros 4xx e 5xx", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Sum", "period": 300, "metrics": [
+                ["AWS/ApiGateway", "4xx", "ApiId", "${ApiAvaliacoes}", {"label": "4xx (dados inválidos ou 429)"}],
+                [".", "5xx", ".", ".", {"label": "5xx (falha no servidor)", "color": "#d62728"}]]}},
+              {"type": "metric", "x": 16, "y": 11, "width": 8, "height": 6, "properties": {"title": "API - Latência (ms)", "region": "${AWS::Region}", "view": "timeSeries", "period": 300, "metrics": [
+                ["AWS/ApiGateway", "Latency", "ApiId", "${ApiAvaliacoes}", {"stat": "p50", "label": "p50"}],
+                ["...", {"stat": "p99", "label": "p99"}]]}},
+
+              {"type": "metric", "x": 0, "y": 17, "width": 8, "height": 6, "properties": {"title": "DynamoDB - Capacidade consumida", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Sum", "period": 300, "metrics": [
+                ["AWS/DynamoDB", "ConsumedWriteCapacityUnits", "TableName", "${Tabela}", {"label": "Escrita"}],
+                [".", "ConsumedReadCapacityUnits", ".", ".", {"label": "Leitura"}]]}},
+              {"type": "metric", "x": 8, "y": 17, "width": 8, "height": 6, "properties": {"title": "Falhas registradas pela aplicação", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Sum", "period": 300, "metrics": [
+                ["PlataformaFeedback/${Ambiente}", "FalhasGravacaoDynamoDB", {"label": "Gravação no DynamoDB"}],
+                [".", "FalhasEnvioAlertaUrgencia", {"label": "Envio do aviso de urgência"}]]}},
+              {"type": "metric", "x": 16, "y": 17, "width": 8, "height": 6, "properties": {"title": "Stream - Idade do registro mais antigo (ms)", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Maximum", "period": 300, "metrics": [
+                ["AWS/Lambda", "IteratorAge", "FunctionName", "${FnNotificar}", {"label": "notificar-urgencia"}]]}},
+
+              {"type": "log", "x": 0, "y": 23, "width": 24, "height": 6, "properties": {"title": "Últimas falhas nos logs das funções", "region": "${AWS::Region}", "view": "table",
+                "query": "SOURCE '${LogsReceberAvaliacao}' | SOURCE '${LogsNotificarUrgencia}' | SOURCE '${LogsGerarRelatorioSemanal}' | fields @timestamp, @log, @message | filter @message like /Falha|Exception|ERROR|Task timed out/ | sort @timestamp desc | limit 50"}}
+            ]
+          }
+        - FnReceber: !Ref ReceberAvaliacaoFunction
+          FnNotificar: !Ref NotificarUrgenciaFunction
+          FnRelatorio: !Ref GerarRelatorioSemanalFunction
+          Tabela: !Ref TabelaAvaliacoes
+          TopicoAlarmesNome: !GetAtt TopicoAlarmes.TopicName
+
+  # ---------------------------------------------------------------------------
+  # Governança de custo
+  # ---------------------------------------------------------------------------
+  # Alerta de orçamento da conta (os créditos do grupo): avisa em 80% do gasto real
+  # e quando a previsão do mês passar de 100%.
+  OrcamentoMensal:
+    Type: AWS::Budgets::Budget
+    Condition: CriarOrcamento
+    Properties:
+      Budget:
+        BudgetName: !Sub "plataforma-feedback-${Ambiente}"
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: !Ref LimiteOrcamentoMensalUsd
+          Unit: USD
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref TopicoAlarmes
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref TopicoAlarmes
+
 Outputs:
   ApiUrl:
     Description: Endpoint para enviar avaliações (POST)
-    Value: !Sub "https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com/avaliacao"
+    Value: !Sub "https://${ApiAvaliacoes}.execute-api.${AWS::Region}.amazonaws.com/avaliacao"
   TabelaAvaliacoesNome:
     Description: Tabela DynamoDB das avaliações
     Value: !Ref TabelaAvaliacoes
   TopicoNotificacoesArn:
     Description: Tópico SNS dos avisos de urgência e do relatório semanal
     Value: !Ref TopicoNotificacoes
+  TopicoAlarmesArn:
+    Description: Tópico SNS dos alarmes técnicos (assine outros administradores aqui)
+    Value: !Ref TopicoAlarmes
+  DashboardUrl:
+    Description: Dashboard do CloudWatch
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards/dashboard/plataforma-feedback-${Ambiente}"
   ReceberAvaliacaoFunctionName:
     Value: !Ref ReceberAvaliacaoFunction
   NotificarUrgenciaFunctionName:
@@ -192,3 +843,12 @@ Outputs:
   GerarRelatorioSemanalFunctionName:
     Description: Pode ser invocada manualmente para gerar o relatório na hora
     Value: !Ref GerarRelatorioSemanalFunction
+  PapelReceberAvaliacaoArn:
+    Description: Papel IAM da receber-avaliacao (usado por scripts/verificar-permissoes.sh)
+    Value: !GetAtt PapelReceberAvaliacao.Arn
+  PapelNotificarUrgenciaArn:
+    Description: Papel IAM da notificar-urgencia
+    Value: !GetAtt PapelNotificarUrgencia.Arn
+  PapelGerarRelatorioSemanalArn:
+    Description: Papel IAM da gerar-relatorio-semanal
+    Value: !GetAtt PapelGerarRelatorioSemanal.Arn

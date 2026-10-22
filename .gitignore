@@ -1,0 +1,20 @@
+# Build
+target/
+.aws-sam/
+*.class
+
+# IDEs
+.idea/
+*.iml
+.vscode/
+.classpath
+.project
+.settings/
+
+# SO
+.DS_Store
+
+# Credenciais e configurações locais (nunca versionar)
+.env
+*.pem
+env.local.json

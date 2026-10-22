@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  POM agregador: permite rodar "mvn verify" na raiz para compilar e testar as
+  três funções de uma vez. Cada função tem um pom.xml independente (sem parent)
+  porque o "sam build" compila cada CodeUri isoladamente.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>br.com.fiap.feedback</groupId>
+    <artifactId>plataforma-feedback</artifactId>
+    <version>1.0.0</version>
+    <packaging>pom</packaging>
+    <name>Plataforma de Feedback de Aulas</name>
+
+    <modules>
+        <module>src/receber_avaliacao</module>
+        <module>src/notificar_urgencia</module>
+        <module>src/gerar_relatorio_semanal</module>
+    </modules>
+</project>

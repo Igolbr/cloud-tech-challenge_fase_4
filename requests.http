@@ -1,0 +1,21 @@
+### Requisições de teste (VS Code REST Client / IntelliJ HTTP Client).
+### Troque a URL pela saída "ApiUrl" do deploy ou use http://127.0.0.1:3000/avaliacao com "sam local start-api".
+@api = http://127.0.0.1:3000/avaliacao
+
+### Avaliação positiva -> 201, urgência BAIXA
+POST {{api}}
+Content-Type: application/json
+
+{ "descricao": "Aula muito clara, exemplos excelentes", "nota": 9 }
+
+### Avaliação crítica -> 201, urgência CRITICA e e-mail aos administradores
+POST {{api}}
+Content-Type: application/json
+
+{ "descricao": "O áudio da aula 3 está inaudível", "nota": 2 }
+
+### Avaliação inválida -> 400
+POST {{api}}
+Content-Type: application/json
+
+{ "descricao": "", "nota": 15 }

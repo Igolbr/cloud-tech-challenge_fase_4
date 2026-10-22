@@ -1,0 +1,88 @@
+name: CI/CD
+
+# Testa em todo push e pull request; implanta na AWS a cada push na main.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  JAVA_VERSION: "21"
+
+jobs:
+  testes:
+    name: Testes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: corretto
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      - name: Testes unitários das três funções
+        run: mvn -B verify
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validar template.yaml
+        run: |
+          pip install cfn-lint
+          cfn-lint template.yaml
+
+  deploy:
+    name: Deploy (AWS SAM)
+    needs: testes
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: corretto
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      - uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      # Credenciais ficam nos segredos do repositório, nunca no código
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: sam build
+        run: sam build
+
+      - name: sam deploy
+        run: |
+          sam deploy \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --region "${{ vars.AWS_REGION || 'us-east-1' }}" \
+            --parameter-overrides "Ambiente=dev EmailAdministrador=${{ secrets.EMAIL_ADMINISTRADOR }}"
+
+      - name: URL da API
+        run: |
+          aws cloudformation describe-stacks \
+            --stack-name plataforma-feedback-dev \
+            --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue" \
+            --output text

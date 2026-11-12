@@ -19,3 +19,14 @@ fail_on_empty_changeset = false
 
 [default.local_start_api.parameters]
 warm_containers = "EAGER"
+
+# Usado pelo GitHub Actions quando o deploy é por OIDC (infra/conta.yaml):
+# o bucket de pacotes e o papel do CloudFormation são passados na linha de comando.
+[ci.global.parameters]
+stack_name = "plataforma-feedback-dev"
+
+[ci.deploy.parameters]
+s3_prefix = "plataforma-feedback-dev"
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = false
+fail_on_empty_changeset = false

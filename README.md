@@ -33,7 +33,9 @@ infraestrutura como código (AWS SAM/CloudFormation).
 | Banco | DynamoDB on-demand, criptografado, com Streams | Guarda as avaliações e dispara o aviso de urgência |
 | Notificação | SNS com assinatura de e-mail | Entrega o aviso de urgência e o relatório |
 | Agendamento | EventBridge Scheduler | Dispara o relatório toda semana |
-| Logs | CloudWatch Logs | Registro de execução das funções |
+| Logs | CloudWatch Logs | Registro de execução das funções e acesso à API (retenção de 30 dias) |
+| Monitoramento | CloudWatch Dashboard e Alarms | Painel das funções/API e 9 alarmes enviados por e-mail (tópico SNS separado) |
+| Governança | IAM, CloudTrail, AWS Budgets | Papel próprio por função, auditoria e alerta de orçamento |
 
 ### Regra de urgência
 
@@ -55,7 +57,7 @@ A urgência é calculada em `receber-avaliacao` e gravada no item.
   `descricao` não pode ser vazia (máx. 2000 caracteres); `nota` deve ser inteiro (`"7"` e `7.5` são rejeitados).
 - **Saída:** `201` com a avaliação criada ou `400` com a lista de erros.
 - **Variáveis de ambiente:** `TABELA_AVALIACOES`, `FUSO_HORARIO`.
-- **Permissões:** apenas escrita na tabela.
+- **Permissões:** apenas `dynamodb:PutItem` na tabela.
 - **Código:** [src/receber_avaliacao](src/receber_avaliacao)
 
 ```bash
@@ -96,7 +98,7 @@ do aluno é armazenado.
 - **Saída:** e-mail via SNS com média das notas, quantidade de avaliações por dia, quantidade
   por urgência e a lista de avaliações (descrição, urgência e data de envio).
 - **Variáveis de ambiente:** `TABELA_AVALIACOES`, `TOPICO_RELATORIO_ARN`, `FUSO_HORARIO`.
-- **Permissões:** leitura da tabela (Query no índice `por-dia`) e publicação no tópico SNS.
+- **Permissões:** apenas `dynamodb:Query` no índice `por-dia` e publicação no tópico SNS.
 - **Código:** [src/gerar_relatorio_semanal](src/gerar_relatorio_semanal)
 
 Para gerar o relatório na hora (ex.: na demonstração):
@@ -117,6 +119,9 @@ aws lambda invoke --function-name gerar-relatorio-semanal-dev /dev/stdout
 │   └── gerar_relatorio_semanal/  # Função 3
 ├── events/                       # Eventos de exemplo para sam local invoke
 ├── requests.http                 # Requisições de teste da API
+├── infra/conta.yaml              # Governança da conta: OIDC do GitHub, CloudTrail, grupo da equipe
+├── scripts/                      # forcar-erro.sh (teste de alarme) e verificar-permissoes.sh (IAM)
+├── docs/                         # Monitoramento e segurança
 └── .github/workflows/deploy.yml  # CI/CD
 ```
 
@@ -155,7 +160,10 @@ Configuração única no GitHub (**Settings → Secrets and variables → Action
 | Secret | `AWS_ACCESS_KEY_ID` | Chave do usuário de deploy |
 | Secret | `AWS_SECRET_ACCESS_KEY` | Segredo do usuário de deploy |
 | Secret | `EMAIL_ADMINISTRADOR` | E-mail que recebe os avisos e o relatório |
+| Secret (opcional) | `EMAIL_ALERTAS` | E-mail dos alarmes técnicos (padrão: o mesmo do administrador) |
 | Variable (opcional) | `AWS_REGION` | Região (padrão `us-east-1`) |
+| Variable (opcional) | `LIMITE_ORCAMENTO_USD` | Limite do alerta de orçamento mensal (padrão 10; 0 desliga) |
+| Variables (OIDC) | `AWS_ROLE_ARN`, `AWS_CFN_EXEC_ROLE_ARN`, `AWS_ARTIFACTS_BUCKET` | Outputs do `infra/conta.yaml`; com elas o deploy dispensa as chaves de acesso |
 
 ### Manual (primeira vez ou sem pipeline)
 
@@ -171,6 +179,16 @@ A URL da API aparece na saída `ApiUrl`.
 Depois do primeiro deploy, a AWS envia ao `EmailAdministrador` um e-mail
 "AWS Notification - Subscription Confirmation". Clique em **Confirm subscription**;
 sem isso nenhum aviso ou relatório é entregue.
+
+## Monitoramento e segurança
+
+Dashboard, alarmes, destinatários, papéis IAM, criptografia, throttling, OIDC, CloudTrail, MFA e
+orçamento estão descritos em [docs/monitoramento-e-seguranca.md](docs/monitoramento-e-seguranca.md).
+
+```bash
+./scripts/forcar-erro.sh dev           # provoca um erro e o alarme manda e-mail em até 5 min
+./scripts/verificar-permissoes.sh dev  # mostra o que cada função pode e não pode fazer
+```
 
 ## Licença
 

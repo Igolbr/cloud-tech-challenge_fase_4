@@ -1,0 +1,413 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Plataforma de Feedback de Aulas - governança da conta AWS (implantado UMA vez, por um
+  administrador, antes de ligar o deploy por OIDC). Cria: acesso do GitHub Actions por OIDC
+  (sem chaves de longa duração), papel de execução do CloudFormation, bucket de artefatos
+  do SAM, trilha do CloudTrail para auditoria e grupo IAM da equipe com MFA obrigatório.
+
+  Deploy:
+    aws cloudformation deploy --template-file infra/conta.yaml --stack-name plataforma-feedback-conta
+      --capabilities CAPABILITY_NAMED_IAM --parameter-overrides RepositorioGitHub=<dono>/<repo>
+
+Parameters:
+  RepositorioGitHub:
+    Type: String
+    Default: Igolbr/cloud-tech-challenge_fase_4
+    Description: Repositório (dono/nome) autorizado a implantar pela AWS.
+    AllowedPattern: "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+  AmbienteGitHub:
+    Type: String
+    Default: dev
+    Description: Nome do environment do GitHub usado pelo job de deploy (deploy.yml usa "dev").
+  NomePilhaAplicacao:
+    Type: String
+    Default: plataforma-feedback
+    Description: Prefixo das pilhas da aplicação (plataforma-feedback-dev, plataforma-feedback-prod).
+  CriarProvedorOidc:
+    Type: String
+    Default: "sim"
+    AllowedValues: ["sim", "nao"]
+    Description: Use "nao" se a conta já tiver o provedor OIDC token.actions.githubusercontent.com.
+  CriarTrilhaCloudTrail:
+    Type: String
+    Default: "sim"
+    AllowedValues: ["sim", "nao"]
+    Description: Use "nao" se a conta já tiver uma trilha registrando eventos de gerenciamento (a segunda trilha é cobrada).
+  DiasRetencaoAuditoria:
+    Type: Number
+    Default: 90
+    MinValue: 1
+    Description: Dias que os registros do CloudTrail ficam no bucket.
+
+Conditions:
+  CriarOidc: !Equals [!Ref CriarProvedorOidc, "sim"]
+  CriarTrilha: !Equals [!Ref CriarTrilhaCloudTrail, "sim"]
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # GitHub Actions -> AWS por OIDC
+  # ---------------------------------------------------------------------------
+  ProvedorOidcGitHub:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CriarOidc
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+        - 1c58a3a8518e8759bf075b76b750d4f2df264fcd
+
+  BucketArtefatos:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${NomePilhaAplicacao}-artefatos-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          - Id: apagar-pacotes-antigos
+            Status: Enabled
+            ExpirationInDays: 30
+      Tags:
+        - Key: Projeto
+          Value: plataforma-feedback
+
+  PoliticaBucketArtefatos:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref BucketArtefatos
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: NegarSemHttps
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt BucketArtefatos.Arn
+              - !Sub "${BucketArtefatos.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  # Papel que o CloudFormation assume para criar os recursos da aplicação. O GitHub
+  # não recebe essas permissões: ele só pode pedir ao CloudFormation para usar este papel.
+  PapelExecucaoCloudFormation:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${NomePilhaAplicacao}-cloudformation"
+      Description: Usado pelo CloudFormation para implantar as pilhas da plataforma de feedback.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: recursos-da-aplicacao
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ServicosDaAplicacao
+                Effect: Allow
+                Action:
+                  - lambda:*
+                  - apigateway:*
+                  - dynamodb:*
+                  - sns:*
+                  - logs:*
+                  - cloudwatch:*
+                  - scheduler:*
+                  - budgets:*
+                Resource: "*"
+              - Sid: PapeisSomenteDaAplicacao
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:PassRole
+                  - iam:UpdateRole
+                  - iam:UpdateRoleDescription
+                  - iam:UpdateAssumeRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                  - iam:TagRole
+                  - iam:UntagRole
+                # Só papéis das pilhas -dev/-prod; não alcança os papéis deste template
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${NomePilhaAplicacao}-dev-*"
+                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${NomePilhaAplicacao}-prod-*"
+              - Sid: PapelVinculadoApiGateway
+                Effect: Allow
+                Action: iam:CreateServiceLinkedRole
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    iam:AWSServiceName: ops.apigateway.amazonaws.com
+              - Sid: LerPacotesDoSam
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "${BucketArtefatos.Arn}/*"
+      Tags:
+        - Key: Projeto
+          Value: plataforma-feedback
+
+  # Papel assumido pelo GitHub Actions. Só o repositório e o environment configurados
+  # conseguem assumi-lo, com token temporário (sem chave de acesso guardada).
+  PapelDeployGitHub:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${NomePilhaAplicacao}-github-deploy"
+      Description: Assumido pelo GitHub Actions (OIDC) para rodar o sam deploy.
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com"
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub:
+                  - !Sub "repo:${RepositorioGitHub}:environment:${AmbienteGitHub}"
+                  - !Sub "repo:${RepositorioGitHub}:ref:refs/heads/main"
+      Policies:
+        - PolicyName: sam-deploy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: PilhasDaAplicacao
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:GetTemplate
+                  - cloudformation:GetTemplateSummary
+                  - cloudformation:ListStackResources
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${NomePilhaAplicacao}-dev/*"
+                  - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${NomePilhaAplicacao}-prod/*"
+              - Sid: TransformacaoDoSam
+                Effect: Allow
+                Action: cloudformation:CreateChangeSet
+                Resource: !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:aws:transform/Serverless-2016-10-31"
+              - Sid: ValidarTemplate
+                Effect: Allow
+                Action:
+                  - cloudformation:ValidateTemplate
+                  - cloudformation:GetTemplateSummary
+                Resource: "*"
+              - Sid: UsarPapelDoCloudFormation
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt PapelExecucaoCloudFormation.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: cloudformation.amazonaws.com
+              - Sid: EnviarPacotes
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub "${BucketArtefatos.Arn}/*"
+              - Sid: ListarBucketDePacotes
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource: !GetAtt BucketArtefatos.Arn
+      Tags:
+        - Key: Projeto
+          Value: plataforma-feedback
+
+  # ---------------------------------------------------------------------------
+  # Auditoria (CloudTrail)
+  # ---------------------------------------------------------------------------
+  BucketAuditoria:
+    Type: AWS::S3::Bucket
+    Condition: CriarTrilha
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${NomePilhaAplicacao}-auditoria-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          - Id: retencao-auditoria
+            Status: Enabled
+            ExpirationInDays: !Ref DiasRetencaoAuditoria
+      Tags:
+        - Key: Projeto
+          Value: plataforma-feedback
+
+  PoliticaBucketAuditoria:
+    Type: AWS::S3::BucketPolicy
+    Condition: CriarTrilha
+    Properties:
+      Bucket: !Ref BucketAuditoria
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: CloudTrailLeAcl
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt BucketAuditoria.Arn
+            Condition:
+              StringEquals:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${NomePilhaAplicacao}-auditoria"
+          - Sid: CloudTrailGrava
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub "${BucketAuditoria.Arn}/AWSLogs/${AWS::AccountId}/*"
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${NomePilhaAplicacao}-auditoria"
+          - Sid: NegarSemHttps
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt BucketAuditoria.Arn
+              - !Sub "${BucketAuditoria.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  TrilhaAuditoria:
+    Type: AWS::CloudTrail::Trail
+    Condition: CriarTrilha
+    DependsOn: PoliticaBucketAuditoria
+    Properties:
+      TrailName: !Sub "${NomePilhaAplicacao}-auditoria"
+      S3BucketName: !Ref BucketAuditoria
+      IsLogging: true
+      IsMultiRegionTrail: true
+      IncludeGlobalServiceEvents: true
+      # Permite provar que os arquivos de log não foram alterados
+      EnableLogFileValidation: true
+      Tags:
+        - Key: Projeto
+          Value: plataforma-feedback
+
+  # ---------------------------------------------------------------------------
+  # Acesso nominal da equipe (cada integrante tem o próprio usuário IAM neste grupo)
+  # ---------------------------------------------------------------------------
+  GrupoEquipe:
+    Type: AWS::IAM::Group
+    Properties:
+      GroupName: !Sub "${NomePilhaAplicacao}-equipe"
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/ReadOnlyAccess"
+        # CloudShell: terminal no console, já autenticado com a sessão (e o MFA) do usuário
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AWSCloudShellFullAccess"
+      Policies:
+        - PolicyName: testar-funcoes
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: InvocarFuncoesDaPlataforma
+                Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:lambda:*:${AWS::AccountId}:function:receber-avaliacao-*"
+                  - !Sub "arn:${AWS::Partition}:lambda:*:${AWS::AccountId}:function:notificar-urgencia-*"
+                  - !Sub "arn:${AWS::Partition}:lambda:*:${AWS::AccountId}:function:gerar-relatorio-semanal-*"
+              - Sid: SimularPermissoesDosPapeis
+                Effect: Allow
+                Action: iam:SimulatePrincipalPolicy
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${NomePilhaAplicacao}-dev-*"
+                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${NomePilhaAplicacao}-prod-*"
+        # Sem MFA o usuário só consegue cadastrar o próprio MFA e trocar a própria senha
+        - PolicyName: exigir-mfa
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: GerenciarProprioMfaESenha
+                Effect: Allow
+                Action:
+                  - iam:GetUser
+                  - iam:ChangePassword
+                  - iam:GetLoginProfile
+                  - iam:ListMFADevices
+                  - iam:ListVirtualMFADevices
+                  - iam:CreateVirtualMFADevice
+                  - iam:EnableMFADevice
+                  - iam:ResyncMFADevice
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:user/${!aws:username}"
+                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:mfa/*"
+              - Sid: NegarTudoSemMfa
+                Effect: Deny
+                NotAction:
+                  - iam:GetUser
+                  - iam:ChangePassword
+                  - iam:GetLoginProfile
+                  - iam:ListMFADevices
+                  - iam:ListVirtualMFADevices
+                  - iam:CreateVirtualMFADevice
+                  - iam:EnableMFADevice
+                  - iam:ResyncMFADevice
+                  - sts:GetSessionToken
+                Resource: "*"
+                Condition:
+                  BoolIfExists:
+                    aws:MultiFactorAuthPresent: "false"
+
+Outputs:
+  PapelDeployGitHubArn:
+    Description: Cadastrar no GitHub como variable AWS_ROLE_ARN
+    Value: !GetAtt PapelDeployGitHub.Arn
+  PapelExecucaoCloudFormationArn:
+    Description: Cadastrar no GitHub como variable AWS_CFN_EXEC_ROLE_ARN
+    Value: !GetAtt PapelExecucaoCloudFormation.Arn
+  BucketArtefatosNome:
+    Description: Cadastrar no GitHub como variable AWS_ARTIFACTS_BUCKET
+    Value: !Ref BucketArtefatos
+  GrupoEquipeNome:
+    Description: Adicionar o usuário IAM de cada integrante neste grupo
+    Value: !Ref GrupoEquipe

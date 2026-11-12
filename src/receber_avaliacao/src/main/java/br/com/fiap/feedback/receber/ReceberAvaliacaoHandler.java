@@ -57,6 +57,7 @@ public class ReceberAvaliacaoHandler implements RequestHandler<APIGatewayV2HTTPE
         try {
             repository.salvar(avaliacao);
         } catch (RuntimeException e) {
+            // O texto "Falha ao gravar" alimenta a métrica FalhasGravacaoDynamoDB (template.yaml)
             log(context, "Falha ao gravar avaliação " + avaliacao.id() + ": " + e);
             // Relança para a Lambda registrar o erro (métrica Errors) e a API responder 500
             throw e;

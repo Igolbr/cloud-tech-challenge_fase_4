@@ -1,6 +1,6 @@
 # Monitoramento, alertas, segurança e governança
 
-Texto do Bloco 2 (Caio) para o README e o vídeo. Tudo o que está aqui é código em
+Complemento do [README](../README.md). Tudo o que está aqui é código em
 [template.yaml](../template.yaml) (aplicação) e [infra/conta.yaml](../infra/conta.yaml)
 (conta AWS), exceto os passos marcados como **manual** no fim.
 
@@ -14,7 +14,7 @@ O dashboard `plataforma-feedback-<ambiente>` no CloudWatch (o link sai no output
 |---|---|
 | Alarmes | Estado atual dos 9 alarmes |
 | Lambda | Invocações, erros, duração máxima (com a linha de 80% do timeout) e throttles das três funções |
-| API | Requisições, erros 4xx e 5xx, latência p50 e p99 |
+| API | Requisições, erros 4xx (inclui `401` de token ausente ou inválido) e 5xx, latência p50 e p99 |
 | Dados | Capacidade de leitura e escrita do DynamoDB, falhas registradas pela aplicação e idade do registro mais antigo no stream |
 | Logs | As 50 falhas mais recentes nos logs das três funções (consulta do Logs Insights) |
 
@@ -106,6 +106,16 @@ O script usa o simulador de políticas do IAM e mostra `allowed` ou `implicitDen
 
 ### API
 
+- **Autenticação:** o `POST /avaliacao` exige `Authorization: Bearer <token>`. O token é um JWT emitido pelo
+  User Pool `plataforma-feedback-alunos-<ambiente>` do **Amazon Cognito**. O **JWT authorizer** do API Gateway
+  valida assinatura, emissor, público (App Client `plataforma-feedback-api-<ambiente>`) e expiração antes de
+  invocar a função; sem token válido a resposta é `401` e nada é executado.
+- **Cadastro controlado:** autocadastro desligado (`AllowAdminCreateUserOnly`); só a equipe cria alunos com
+  `./scripts/cadastrar-aluno.sh`. Senha mínima de 12 caracteres com maiúscula, minúscula e número; recuperação
+  de conta só pelo administrador; o login não revela se o usuário existe.
+- **Tokens curtos:** token de acesso de 1 hora, refresh token de 1 dia, com revogação habilitada.
+- **Log de acesso:** registra o motivo da recusa (`erroAutorizacao`) para investigar `401`, sem guardar
+  identificador do aluno.
 - **Throttling:** 10 requisições/s em média com picos de até 20 (parâmetros `ApiLimiteRequisicoesPorSegundo` e `ApiLimiteRajada`). Acima disso a API responde `429 Too Many Requests` sem invocar a função.
 - **Validação:** a `receber-avaliacao` rejeita corpo inválido com `400` antes de gravar.
 
@@ -137,6 +147,7 @@ Cada integrante usa um **usuário IAM nominal** no grupo `plataforma-feedback-eq
 
 - Leitura do console (`ReadOnlyAccess`) e CloudShell.
 - Invocação das três funções e o simulador de políticas, para testes e para o vídeo.
+- Cadastro e remoção de alunos de teste no Cognito (`AdminCreateUser`, `AdminSetUserPassword`, `AdminDeleteUser`).
 - **MFA obrigatório:** sem MFA o usuário só consegue cadastrar o próprio MFA e trocar a senha; todo o resto é negado.
 
 Ninguém usa a conta raiz no dia a dia.
@@ -166,7 +177,7 @@ aws cloudformation describe-stacks --stack-name plataforma-feedback-conta \
 Use `CriarProvedorOidc=nao` se a conta já tiver o provedor do GitHub, e `CriarTrilhaCloudTrail=nao` se já
 existir uma trilha (a segunda trilha de eventos de gerenciamento é cobrada).
 
-### 2. GitHub (Settings → Secrets and variables → Actions)
+### 2. GitHub (Settings > Secrets and variables > Actions)
 
 | Tipo | Nome | Valor |
 |---|---|---|
@@ -182,13 +193,13 @@ Depois do primeiro deploy por OIDC, apague os segredos `AWS_ACCESS_KEY_ID` e `AW
 
 ### 3. Passos manuais (não dá para fazer por código)
 
-- [ ] **MFA na conta raiz:** console → nome da conta → *Security credentials* → *Assign MFA device*.
+- [ ] **MFA na conta raiz:** console > nome da conta > *Security credentials* > *Assign MFA device*.
 - [ ] **Usuários nominais:** criar um usuário IAM por integrante (Igor, Caio, Luciano), com acesso ao console, no grupo `plataforma-feedback-equipe`; cada um cadastra o próprio MFA no primeiro login.
 - [ ] **Confirmar as assinaturas** de e-mail do tópico de notificações e do tópico de alarmes.
-- [ ] **Tags de custo:** Billing → *Cost allocation tags* → ativar `Projeto` e `Ambiente` (para filtrar o gasto por projeto no Cost Explorer).
+- [ ] **Tags de custo:** Billing > *Cost allocation tags* > ativar `Projeto` e `Ambiente` (para filtrar o gasto por projeto no Cost Explorer).
 - [ ] **Teste final:** `./scripts/forcar-erro.sh` gera o e-mail de alarme e `./scripts/verificar-permissoes.sh` mostra os acessos negados.
 
-## Observações para o primeiro deploy deste bloco
+## Observações para o primeiro deploy
 
 - **A URL da API muda uma vez:** a API passou a ser declarada explicitamente (`ApiAvaliacoes`) para ter throttling e log de acesso. Pegue a nova URL no output `ApiUrl` e atualize o `requests.http`/Postman.
 - **Logs antigos:** os grupos `/aws/lambda/<função>` criados antes deste bloco não são mais usados e não pertencem à pilha; podem ser apagados no console.

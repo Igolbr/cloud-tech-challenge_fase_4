@@ -133,6 +133,7 @@ Resources:
                   - cloudwatch:*
                   - scheduler:*
                   - budgets:*
+                  - cognito-idp:*
                 Resource: "*"
               - Sid: PapeisSomenteDaAplicacao
                 Effect: Allow
@@ -362,6 +363,13 @@ Resources:
                 Resource:
                   - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${NomePilhaAplicacao}-dev-*"
                   - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${NomePilhaAplicacao}-prod-*"
+              - Sid: CadastrarAlunosDeTeste
+                Effect: Allow
+                Action:
+                  - cognito-idp:AdminCreateUser
+                  - cognito-idp:AdminSetUserPassword
+                  - cognito-idp:AdminDeleteUser
+                Resource: !Sub "arn:${AWS::Partition}:cognito-idp:*:${AWS::AccountId}:userpool/*"
         # Sem MFA o usuário só consegue cadastrar o próprio MFA e trocar a própria senha
         - PolicyName: exigir-mfa
           PolicyDocument:

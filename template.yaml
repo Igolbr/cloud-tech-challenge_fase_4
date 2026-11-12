@@ -5,7 +5,8 @@ Description: >
   Três funções Lambda com responsabilidade única: receber-avaliacao (API),
   notificar-urgencia (DynamoDB Streams) e gerar-relatorio-semanal (EventBridge Scheduler).
   Inclui monitoramento (dashboard, alarmes, retenção de logs) e segurança
-  (papéis IAM de menor privilégio, criptografia, throttling da API, orçamento).
+  (autenticação JWT com Cognito, papéis IAM de menor privilégio, criptografia,
+  throttling da API, orçamento).
 
 Parameters:
   Ambiente:
@@ -412,6 +413,51 @@ Resources:
         - Key: Ambiente
           Value: !Ref Ambiente
 
+  CadastroAlunos:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "plataforma-feedback-alunos-${Ambiente}"
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      UsernameConfiguration:
+        CaseSensitive: false
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          TemporaryPasswordValidityDays: 7
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: admin_only
+            Priority: 1
+      MfaConfiguration: "OFF"
+      DeletionProtection: INACTIVE
+      UserPoolTags:
+        Projeto: plataforma-feedback
+        Ambiente: !Ref Ambiente
+
+  ClienteApiAvaliacoes:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub "plataforma-feedback-api-${Ambiente}"
+      UserPoolId: !Ref CadastroAlunos
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      RefreshTokenValidity: 1
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+
   # ---------------------------------------------------------------------------
   # API (HTTP API só aceita HTTPS; não existe endpoint HTTP)
   # ---------------------------------------------------------------------------
@@ -419,6 +465,15 @@ Resources:
     Type: AWS::Serverless::HttpApi
     Properties:
       Description: API pública da plataforma de feedback (POST /avaliacao).
+      Auth:
+        DefaultAuthorizer: CognitoAlunos
+        Authorizers:
+          CognitoAlunos:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              issuer: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${CadastroAlunos}"
+              audience:
+                - !Ref ClienteApiAvaliacoes
       # Limita a taxa de requisições para evitar abuso; o excedente recebe 429
       DefaultRouteSettings:
         ThrottlingRateLimit: !Ref ApiLimiteRequisicoesPorSegundo
@@ -429,7 +484,8 @@ Resources:
         Format: >-
           {"requestId":"$context.requestId","horario":"$context.requestTime","rota":"$context.routeKey",
           "status":"$context.status","latenciaMs":"$context.responseLatency",
-          "latenciaIntegracaoMs":"$context.integrationLatency","erroIntegracao":"$context.integrationErrorMessage"}
+          "latenciaIntegracaoMs":"$context.integrationLatency","erroIntegracao":"$context.integrationErrorMessage",
+          "erroAutorizacao":"$context.authorizer.error"}
       Tags:
         Projeto: plataforma-feedback
         Ambiente: !Ref Ambiente
@@ -761,7 +817,7 @@ Resources:
               {"type": "metric", "x": 0, "y": 11, "width": 8, "height": 6, "properties": {"title": "API - Requisições", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Sum", "period": 300, "metrics": [
                 ["AWS/ApiGateway", "Count", "ApiId", "${ApiAvaliacoes}", {"label": "Total"}]]}},
               {"type": "metric", "x": 8, "y": 11, "width": 8, "height": 6, "properties": {"title": "API - Erros 4xx e 5xx", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Sum", "period": 300, "metrics": [
-                ["AWS/ApiGateway", "4xx", "ApiId", "${ApiAvaliacoes}", {"label": "4xx (dados inválidos ou 429)"}],
+                ["AWS/ApiGateway", "4xx", "ApiId", "${ApiAvaliacoes}", {"label": "4xx (400 dados inválidos, 401 sem token, 429 limite)"}],
                 [".", "5xx", ".", ".", {"label": "5xx (falha no servidor)", "color": "#d62728"}]]}},
               {"type": "metric", "x": 16, "y": 11, "width": 8, "height": 6, "properties": {"title": "API - Latência (ms)", "region": "${AWS::Region}", "view": "timeSeries", "period": 300, "metrics": [
                 ["AWS/ApiGateway", "Latency", "ApiId", "${ApiAvaliacoes}", {"stat": "p50", "label": "p50"}],
@@ -824,6 +880,12 @@ Outputs:
   ApiUrl:
     Description: Endpoint para enviar avaliações (POST)
     Value: !Sub "https://${ApiAvaliacoes}.execute-api.${AWS::Region}.amazonaws.com/avaliacao"
+  CadastroAlunosId:
+    Description: User Pool do Cognito com os alunos autorizados a avaliar
+    Value: !Ref CadastroAlunos
+  ClienteApiAvaliacoesId:
+    Description: App Client do Cognito usado para obter o token de acesso da API
+    Value: !Ref ClienteApiAvaliacoes
   TabelaAvaliacoesNome:
     Description: Tabela DynamoDB das avaliações
     Value: !Ref TabelaAvaliacoes

@@ -1,0 +1,407 @@
+{
+  "info": {
+    "name": "Plataforma de Feedback de Aulas",
+    "description": "Requisições de teste do POST /avaliacao. A API exige token do Cognito. Antes de rodar, preencha na aba Variables da coleção: apiUrl (saída ApiUrl), clienteId (saída ClienteApiAvaliacoesId), regiao, usuario e senha do aluno cadastrado com scripts/cadastrar-aluno.sh. Rode primeiro a pasta Autenticação: ela guarda o token em tokenAcesso.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "apiUrl",
+      "value": "https://SEU-API-ID.execute-api.us-east-1.amazonaws.com/avaliacao",
+      "type": "string"
+    },
+    {
+      "key": "regiao",
+      "value": "us-east-1",
+      "type": "string"
+    },
+    {
+      "key": "clienteId",
+      "value": "SEU-CLIENT-ID",
+      "type": "string"
+    },
+    {
+      "key": "usuario",
+      "value": "aluno.teste",
+      "type": "string"
+    },
+    {
+      "key": "senha",
+      "value": "",
+      "type": "secret"
+    },
+    {
+      "key": "tokenAcesso",
+      "value": "",
+      "type": "secret"
+    }
+  ],
+  "item": [
+    {
+      "name": "Autenticação",
+      "item": [
+        {
+          "name": "Obter token do aluno (Cognito) - 200",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));",
+                  "",
+                  "pm.test('Guarda o token de acesso', () => {",
+                  "    const token = pm.response.json().AuthenticationResult.AccessToken;",
+                  "    pm.expect(token).to.be.a('string');",
+                  "    pm.collectionVariables.set('tokenAcesso', token);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/x-amz-json-1.1"
+              },
+              {
+                "key": "X-Amz-Target",
+                "value": "AWSCognitoIdentityProviderService.InitiateAuth"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"AuthFlow\": \"USER_PASSWORD_AUTH\",\n  \"ClientId\": \"{{clienteId}}\",\n  \"AuthParameters\": {\n    \"USERNAME\": \"{{usuario}}\",\n    \"PASSWORD\": \"{{senha}}\"\n  }\n}"
+            },
+            "url": "https://cognito-idp.{{regiao}}.amazonaws.com/"
+          }
+        },
+        {
+          "name": "Sem token - 401",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 401', () => pm.response.to.have.status(401));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"descricao\": \"Aula muito clara, exemplos excelentes\",\n  \"nota\": 9\n}"
+            },
+            "url": "{{apiUrl}}",
+            "auth": {
+              "type": "noauth"
+            }
+          }
+        },
+        {
+          "name": "Token inválido - 401",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 401', () => pm.response.to.have.status(401));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"descricao\": \"Aula muito clara, exemplos excelentes\",\n  \"nota\": 9\n}"
+            },
+            "url": "{{apiUrl}}",
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "token-invalido",
+                  "type": "string"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Avaliações válidas",
+      "item": [
+        {
+          "name": "Avaliação positiva (nota 9) - 201 BAIXA",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 201', () => pm.response.to.have.status(201));",
+                  "",
+                  "pm.test('Urgência BAIXA', () => {",
+                  "    const corpo = pm.response.json();",
+                  "    pm.expect(corpo.urgencia).to.eql('BAIXA');",
+                  "    pm.expect(corpo.nota).to.eql(9);",
+                  "    pm.expect(corpo.id).to.be.a('string');",
+                  "    pm.expect(corpo.dataEnvio).to.be.a('string');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"descricao\": \"Aula muito clara, exemplos excelentes\",\n  \"nota\": 9\n}"
+            },
+            "url": "{{apiUrl}}"
+          }
+        },
+        {
+          "name": "Avaliação média (nota 5) - 201 MEDIA",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 201', () => pm.response.to.have.status(201));",
+                  "",
+                  "pm.test('Urgência MEDIA', () => {",
+                  "    pm.expect(pm.response.json().urgencia).to.eql('MEDIA');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"descricao\": \"Conteúdo bom, mas faltou um exemplo prático no final\",\n  \"nota\": 5\n}"
+            },
+            "url": "{{apiUrl}}"
+          }
+        },
+        {
+          "name": "Avaliação crítica (nota 2) - 201 CRITICA e e-mail",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 201', () => pm.response.to.have.status(201));",
+                  "",
+                  "pm.test('Urgência CRITICA', () => {",
+                  "    pm.expect(pm.response.json().urgencia).to.eql('CRITICA');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"descricao\": \"O áudio da aula 3 está inaudível\",\n  \"nota\": 2\n}"
+            },
+            "url": "{{apiUrl}}"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Avaliações inválidas",
+      "item": [
+        {
+          "name": "Descrição vazia e nota 15 - 400",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 400', () => pm.response.to.have.status(400));",
+                  "",
+                  "pm.test('Retorna os dois erros juntos', () => {",
+                  "    const erros = pm.response.json().erros;",
+                  "    pm.expect(erros).to.have.lengthOf(2);",
+                  "    pm.expect(erros[0]).to.include('descricao');",
+                  "    pm.expect(erros[1]).to.include('nota');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"descricao\": \"\",\n  \"nota\": 15\n}"
+            },
+            "url": "{{apiUrl}}"
+          }
+        },
+        {
+          "name": "Nota decimal (7.5) - 400",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 400', () => pm.response.to.have.status(400));",
+                  "",
+                  "pm.test('Erro na nota', () => {",
+                  "    pm.expect(pm.response.json().erros[0]).to.include('inteiro');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"descricao\": \"Boa aula\",\n  \"nota\": 7.5\n}"
+            },
+            "url": "{{apiUrl}}"
+          }
+        },
+        {
+          "name": "Nota como texto (\"8\") - 400",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 400', () => pm.response.to.have.status(400));",
+                  "",
+                  "pm.test('Erro na nota', () => {",
+                  "    pm.expect(pm.response.json().erros[0]).to.include('inteiro');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"descricao\": \"Boa aula\",\n  \"nota\": \"8\"\n}"
+            },
+            "url": "{{apiUrl}}"
+          }
+        },
+        {
+          "name": "JSON inválido - 400",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 400', () => pm.response.to.have.status(400));",
+                  "",
+                  "pm.test('Mensagem de JSON inválido', () => {",
+                  "    pm.expect(pm.response.json().erros[0]).to.include('JSON');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{ \"descricao\": \"Boa aula\", \"nota\": "
+            },
+            "url": "{{apiUrl}}"
+          }
+        }
+      ]
+    }
+  ],
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{tokenAcesso}}",
+        "type": "string"
+      }
+    ]
+  }
+}
